@@ -138,7 +138,7 @@ Run this step inside the DiffSynth environment.
 Current implementation constraint:
 
 * `text_pref_dpo` only supports LoRA training on `dit`
-* leave `--trainable_models` empty
+* omit `--trainable_models` or leave it empty
 * use `--lora_base_model "dit"`
 
 Example:

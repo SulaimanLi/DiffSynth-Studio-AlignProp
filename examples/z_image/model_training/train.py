@@ -28,10 +28,11 @@ class ZImageTrainingModule(DiffusionTrainingModule):
         enable_npu_patch=True,
     ):
         super().__init__()
+        trainable_models = None if trainable_models in (None, "") else trainable_models
         if task.startswith("text_pref_dpo:"):
             raise NotImplementedError("Split cached training is not implemented for text_pref_dpo yet.")
         if task == "text_pref_dpo":
-            if trainable_models not in (None, ""):
+            if trainable_models is not None:
                 raise ValueError("text_pref_dpo only supports LoRA training on `dit`. Leave `trainable_models` empty.")
             if lora_base_model != "dit":
                 raise ValueError("text_pref_dpo requires `--lora_base_model dit`.")
