@@ -10,6 +10,7 @@ The recommended setup is:
 
 * run TextPecker scoring inside the TextPecker / ms-swift environment
 * run metadata building and Z-Image training inside the DiffSynth environment
+* keep all modules frozen except `dit` LoRA during `text_pref_dpo`
 
 ## Files
 
@@ -134,6 +135,12 @@ The output contains:
 
 Run this step inside the DiffSynth environment.
 
+Current implementation constraint:
+
+* `text_pref_dpo` only supports LoRA training on `dit`
+* leave `--trainable_models` empty
+* use `--lora_base_model "dit"`
+
 Example:
 
 ```bash
@@ -175,7 +182,8 @@ Key arguments:
 
 Notes:
 
-* `dpo` uses a frozen reference copy of the current iteration models
+* `dpo` uses a frozen reference branch
+* for memory reasons, only `dit` is duplicated in the reference branch; other frozen modules are shared
 * `ranking` does not use a reference model and is cheaper
 * split-cache training for `text_pref_dpo` is not implemented in the current version
 

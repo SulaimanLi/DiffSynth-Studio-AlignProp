@@ -107,6 +107,10 @@ def infer_batch(engine, runtime, prompt_items, request_config, request_format="a
         responses = engine.infer(requests, request_config=request_config)
         if not isinstance(responses, list):
             responses = [responses]
+        if len(responses) != len(prompt_items):
+            raise RuntimeError(
+                f"engine.infer returned {len(responses)} responses for {len(prompt_items)} requests."
+            )
         return responses, active_format
     except Exception:
         if request_format != "auto":
@@ -115,6 +119,10 @@ def infer_batch(engine, runtime, prompt_items, request_config, request_format="a
     responses = engine.infer(requests, request_config=request_config)
     if not isinstance(responses, list):
         responses = [responses]
+    if len(responses) != len(prompt_items):
+        raise RuntimeError(
+            f"engine.infer returned {len(responses)} responses for {len(prompt_items)} requests."
+        )
     return responses, active_format
 
 

@@ -30,6 +30,11 @@ class ZImageTrainingModule(DiffusionTrainingModule):
         super().__init__()
         if task.startswith("text_pref_dpo:"):
             raise NotImplementedError("Split cached training is not implemented for text_pref_dpo yet.")
+        if task == "text_pref_dpo":
+            if trainable_models not in (None, ""):
+                raise ValueError("text_pref_dpo only supports LoRA training on `dit`. Leave `trainable_models` empty.")
+            if lora_base_model != "dit":
+                raise ValueError("text_pref_dpo requires `--lora_base_model dit`.")
         # Load models
         model_configs = self.parse_model_configs(model_paths, model_id_with_origin_paths, fp8_models=fp8_models, offload_models=offload_models, device=device)
         tokenizer_config = ModelConfig(model_id="Tongyi-MAI/Z-Image-Turbo", origin_file_pattern="tokenizer/") if tokenizer_path is None else ModelConfig(tokenizer_path)
@@ -52,6 +57,8 @@ class ZImageTrainingModule(DiffusionTrainingModule):
         self.task = task
         self.preference_loss_type = preference_loss_type
         self.reference_models = torch.nn.ModuleDict()
+        self.reference_model_names = set()
+        self.lora_base_model = lora_base_model
         self.task_to_loss = {
             "sft:data_process": lambda pipe, *args: args,
             "direct_distill:data_process": lambda pipe, *args: args,
@@ -79,17 +86,27 @@ class ZImageTrainingModule(DiffusionTrainingModule):
             self.pipe_teacher.requires_grad_(False)
 
     def build_reference_models(self):
-        for name in self.pipe.in_iteration_models:
-            model = getattr(self.pipe, name)
-            if model is None:
-                continue
-            reference_model = copy.deepcopy(model)
-            reference_model.requires_grad_(False)
-            reference_model.eval()
-            self.reference_models[name] = reference_model
+        # text_pref_dpo only trains LoRA on the DiT branch.
+        # Frozen modules can be shared with the current pipeline because their weights never change.
+        if self.lora_base_model is None:
+            return
+        model = getattr(self.pipe, self.lora_base_model)
+        if model is None:
+            return
+        reference_model = copy.deepcopy(model)
+        reference_model.requires_grad_(False)
+        reference_model.eval()
+        self.reference_models[self.lora_base_model] = reference_model
+        self.reference_model_names.add(self.lora_base_model)
 
     def get_reference_iteration_models(self):
-        return {name: self.reference_models[name] for name in self.reference_models}
+        models = {}
+        for name in self.pipe.in_iteration_models:
+            if name in self.reference_model_names:
+                models[name] = self.reference_models[name]
+            else:
+                models[name] = getattr(self.pipe, name)
+        return models
 
     def build_shared_inputs(self, image):
         return {
