@@ -2,30 +2,50 @@ from .base_pipeline import BasePipeline
 import torch
 
 
-def FlowMatchSFTLoss(pipe: BasePipeline, **inputs):
+def _sample_flow_match_timestep_ids(pipe: BasePipeline, inputs, num_timestep_samples=1):
     max_timestep_boundary = int(inputs.get("max_timestep_boundary", 1) * len(pipe.scheduler.timesteps))
     min_timestep_boundary = int(inputs.get("min_timestep_boundary", 0) * len(pipe.scheduler.timesteps))
+    timestep_ids = torch.randint(min_timestep_boundary, max_timestep_boundary, (num_timestep_samples,))
+    return timestep_ids
 
-    timestep_id = torch.randint(min_timestep_boundary, max_timestep_boundary, (1,))
-    timestep = pipe.scheduler.timesteps[timestep_id].to(dtype=pipe.torch_dtype, device=pipe.device)
-    
-    noise = torch.randn_like(inputs["input_latents"])
-    inputs["latents"] = pipe.scheduler.add_noise(inputs["input_latents"], noise, timestep)
-    training_target = pipe.scheduler.training_target(inputs["input_latents"], noise, timestep)
-    
-    if "first_frame_latents" in inputs:
-        inputs["latents"][:, :, 0:1] = inputs["first_frame_latents"]
-    
-    models = {name: getattr(pipe, name) for name in pipe.in_iteration_models}
-    noise_pred = pipe.model_fn(**models, **inputs, timestep=timestep)
-    
-    if "first_frame_latents" in inputs:
-        noise_pred = noise_pred[:, :, 1:]
-        training_target = training_target[:, :, 1:]
-    
-    loss = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float())
-    loss = loss * pipe.scheduler.training_weight(timestep)
-    return loss
+
+def _prepare_flow_match_noise(input_latents, num_timestep_samples=1):
+    return [torch.randn_like(input_latents) for _ in range(num_timestep_samples)]
+
+
+def _flow_match_loss_from_samples(pipe: BasePipeline, models, inputs, timestep_ids, noises):
+    losses = []
+    for timestep_id, noise in zip(timestep_ids, noises):
+        timestep = pipe.scheduler.timesteps[timestep_id].unsqueeze(0).to(dtype=pipe.torch_dtype, device=pipe.device)
+
+        inputs_ = dict(inputs)
+        inputs_["latents"] = pipe.scheduler.add_noise(inputs["input_latents"], noise, timestep)
+        training_target = pipe.scheduler.training_target(inputs["input_latents"], noise, timestep)
+
+        if "first_frame_latents" in inputs_:
+            inputs_["latents"][:, :, 0:1] = inputs_["first_frame_latents"]
+
+        noise_pred = pipe.model_fn(**models, **inputs_, timestep=timestep)
+
+        if "first_frame_latents" in inputs_:
+            noise_pred = noise_pred[:, :, 1:]
+            training_target = training_target[:, :, 1:]
+
+        loss = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float())
+        loss = loss * pipe.scheduler.training_weight(timestep)
+        losses.append(loss.reshape(()))
+    return torch.stack(losses).mean()
+
+
+def FlowMatchLoss(pipe: BasePipeline, models=None, num_timestep_samples=1, timestep_ids=None, noises=None, **inputs):
+    models = {name: getattr(pipe, name) for name in pipe.in_iteration_models} if models is None else models
+    timestep_ids = _sample_flow_match_timestep_ids(pipe, inputs, num_timestep_samples) if timestep_ids is None else timestep_ids
+    noises = _prepare_flow_match_noise(inputs["input_latents"], len(timestep_ids)) if noises is None else noises
+    return _flow_match_loss_from_samples(pipe, models, inputs, timestep_ids, noises)
+
+
+def FlowMatchSFTLoss(pipe: BasePipeline, **inputs):
+    return FlowMatchLoss(pipe, **inputs)
 
 
 def FlowMatchSFTAudioVideoLoss(pipe: BasePipeline, **inputs):
@@ -68,6 +88,96 @@ def DirectDistillLoss(pipe: BasePipeline, **inputs):
         inputs["latents"] = pipe.step(pipe.scheduler, progress_id=progress_id, noise_pred=noise_pred, **inputs)
     loss = torch.nn.functional.mse_loss(inputs["latents"].float(), inputs["input_latents"].float())
     return loss
+
+
+class FlowMatchPreferenceLoss(torch.nn.Module):
+    def __init__(
+        self,
+        beta=100.0,
+        num_timestep_samples=4,
+        preference_loss_weight=1.0,
+        sft_loss_weight=0.1,
+        loss_type="dpo",
+    ):
+        super().__init__()
+        self.beta = beta
+        self.num_timestep_samples = num_timestep_samples
+        self.preference_loss_weight = preference_loss_weight
+        self.sft_loss_weight = sft_loss_weight
+        self.loss_type = loss_type
+
+    def _sample_branch_noises(self, chosen_inputs, rejected_inputs):
+        chosen_noises = _prepare_flow_match_noise(chosen_inputs["input_latents"], self.num_timestep_samples)
+        if chosen_inputs["input_latents"].shape == rejected_inputs["input_latents"].shape:
+            rejected_noises = [noise.clone() for noise in chosen_noises]
+        else:
+            rejected_noises = _prepare_flow_match_noise(rejected_inputs["input_latents"], self.num_timestep_samples)
+        return chosen_noises, rejected_noises
+
+    def _preference_logits(self, current_losses, reference_losses):
+        chosen_current_loss, rejected_current_loss = current_losses
+        chosen_reference_loss, rejected_reference_loss = reference_losses
+        if self.loss_type == "dpo":
+            return (rejected_current_loss - chosen_current_loss) - (rejected_reference_loss - chosen_reference_loss)
+        elif self.loss_type == "ranking":
+            return rejected_current_loss - chosen_current_loss
+        else:
+            raise ValueError(f"Unsupported preference loss type: {self.loss_type}")
+
+    def forward(self, pipe: BasePipeline, preference_inputs, reference_models=None):
+        chosen_inputs = preference_inputs["chosen"]
+        rejected_inputs = preference_inputs["rejected"]
+
+        timestep_ids = _sample_flow_match_timestep_ids(pipe, chosen_inputs, self.num_timestep_samples)
+        chosen_noises, rejected_noises = self._sample_branch_noises(chosen_inputs, rejected_inputs)
+
+        current_models = {name: getattr(pipe, name) for name in pipe.in_iteration_models}
+        chosen_current_loss = FlowMatchLoss(
+            pipe,
+            models=current_models,
+            timestep_ids=timestep_ids,
+            noises=chosen_noises,
+            **chosen_inputs,
+        )
+        rejected_current_loss = FlowMatchLoss(
+            pipe,
+            models=current_models,
+            timestep_ids=timestep_ids,
+            noises=rejected_noises,
+            **rejected_inputs,
+        )
+
+        if self.loss_type == "dpo":
+            if reference_models is None:
+                raise ValueError("reference_models is required when preference_loss_type is dpo.")
+            with torch.no_grad():
+                chosen_reference_loss = FlowMatchLoss(
+                    pipe,
+                    models=reference_models,
+                    timestep_ids=timestep_ids,
+                    noises=chosen_noises,
+                    **chosen_inputs,
+                )
+                rejected_reference_loss = FlowMatchLoss(
+                    pipe,
+                    models=reference_models,
+                    timestep_ids=timestep_ids,
+                    noises=rejected_noises,
+                    **rejected_inputs,
+                )
+        else:
+            chosen_reference_loss = torch.zeros_like(chosen_current_loss)
+            rejected_reference_loss = torch.zeros_like(rejected_current_loss)
+
+        preference_logits = self._preference_logits(
+            (chosen_current_loss, rejected_current_loss),
+            (chosen_reference_loss, rejected_reference_loss),
+        )
+        preference_loss = -torch.nn.functional.logsigmoid(self.beta * preference_logits)
+        loss = self.preference_loss_weight * preference_loss
+        if self.sft_loss_weight > 0:
+            loss = loss + self.sft_loss_weight * chosen_current_loss
+        return loss
 
 
 class TrajectoryImitationLoss(torch.nn.Module):

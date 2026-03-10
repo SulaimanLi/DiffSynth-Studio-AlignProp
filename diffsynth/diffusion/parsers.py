@@ -54,6 +54,14 @@ def add_lora_config(parser: argparse.ArgumentParser):
     parser.add_argument("--preset_lora_model", type=str, default=None, help="Which model the preset LoRA is fused to.")
     return parser
 
+def add_preference_config(parser: argparse.ArgumentParser):
+    parser.add_argument("--preference_loss_type", type=str, default="dpo", choices=("dpo", "ranking"), help="Preference loss type.")
+    parser.add_argument("--preference_beta", type=float, default=100.0, help="Inverse temperature used by the preference loss.")
+    parser.add_argument("--preference_num_timesteps", type=int, default=4, help="Number of flow-matching timesteps used to estimate each preference score.")
+    parser.add_argument("--preference_loss_weight", type=float, default=1.0, help="Weight of the pairwise preference loss.")
+    parser.add_argument("--preference_sft_weight", type=float, default=0.1, help="Weight of the SFT regularization loss on the chosen sample.")
+    return parser
+
 def add_gradient_config(parser: argparse.ArgumentParser):
     parser.add_argument("--use_gradient_checkpointing", default=False, action="store_true", help="Whether to use gradient checkpointing.")
     parser.add_argument("--use_gradient_checkpointing_offload", default=False, action="store_true", help="Whether to offload gradient checkpointing to CPU memory.")
@@ -66,5 +74,6 @@ def add_general_config(parser: argparse.ArgumentParser):
     parser = add_training_config(parser)
     parser = add_output_config(parser)
     parser = add_lora_config(parser)
+    parser = add_preference_config(parser)
     parser = add_gradient_config(parser)
     return parser

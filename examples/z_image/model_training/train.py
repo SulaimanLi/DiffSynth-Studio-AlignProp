@@ -20,9 +20,16 @@ class ZImageTrainingModule(DiffusionTrainingModule):
         offload_models=None,
         device="cpu",
         task="sft",
+        preference_loss_type="dpo",
+        preference_beta=100.0,
+        preference_num_timesteps=4,
+        preference_loss_weight=1.0,
+        preference_sft_weight=0.1,
         enable_npu_patch=True,
     ):
         super().__init__()
+        if task.startswith("text_pref_dpo:"):
+            raise NotImplementedError("Split cached training is not implemented for text_pref_dpo yet.")
         # Load models
         model_configs = self.parse_model_configs(model_paths, model_id_with_origin_paths, fp8_models=fp8_models, offload_models=offload_models, device=device)
         tokenizer_config = ModelConfig(model_id="Tongyi-MAI/Z-Image-Turbo", origin_file_pattern="tokenizer/") if tokenizer_path is None else ModelConfig(tokenizer_path)
@@ -43,6 +50,8 @@ class ZImageTrainingModule(DiffusionTrainingModule):
         self.extra_inputs = extra_inputs.split(",") if extra_inputs is not None else []
         self.fp8_models = fp8_models
         self.task = task
+        self.preference_loss_type = preference_loss_type
+        self.reference_models = torch.nn.ModuleDict()
         self.task_to_loss = {
             "sft:data_process": lambda pipe, *args: args,
             "direct_distill:data_process": lambda pipe, *args: args,
@@ -51,6 +60,16 @@ class ZImageTrainingModule(DiffusionTrainingModule):
             "direct_distill": lambda pipe, inputs_shared, inputs_posi, inputs_nega: DirectDistillLoss(pipe, **inputs_shared, **inputs_posi),
             "direct_distill:train": lambda pipe, inputs_shared, inputs_posi, inputs_nega: DirectDistillLoss(pipe, **inputs_shared, **inputs_posi),
         }
+        if task == "text_pref_dpo":
+            self.loss_fn = FlowMatchPreferenceLoss(
+                beta=preference_beta,
+                num_timestep_samples=preference_num_timesteps,
+                preference_loss_weight=preference_loss_weight,
+                sft_loss_weight=preference_sft_weight,
+                loss_type=preference_loss_type,
+            )
+            if preference_loss_type == "dpo":
+                self.build_reference_models()
         if task == "trajectory_imitation":
             # This is an experimental feature.
             # We may remove it in the future.
@@ -58,34 +77,82 @@ class ZImageTrainingModule(DiffusionTrainingModule):
             self.task_to_loss["trajectory_imitation"] = self.loss_fn
             self.pipe_teacher = copy.deepcopy(self.pipe)
             self.pipe_teacher.requires_grad_(False)
-        
-    def get_pipeline_inputs(self, data):
-        inputs_posi = {"prompt": data["prompt"]}
-        inputs_nega = {"negative_prompt": ""}
-        inputs_shared = {
-            # Assume you are using this pipeline for inference,
-            # please fill in the input parameters.
-            "input_image": data["image"],
-            "height": data["image"].size[1],
-            "width": data["image"].size[0],
-            # Please do not modify the following parameters
-            # unless you clearly know what this will cause.
+
+    def build_reference_models(self):
+        for name in self.pipe.in_iteration_models:
+            model = getattr(self.pipe, name)
+            if model is None:
+                continue
+            reference_model = copy.deepcopy(model)
+            reference_model.requires_grad_(False)
+            reference_model.eval()
+            self.reference_models[name] = reference_model
+
+    def get_reference_iteration_models(self):
+        return {name: self.reference_models[name] for name in self.reference_models}
+
+    def build_shared_inputs(self, image):
+        return {
+            "input_image": image,
+            "height": image.size[1],
+            "width": image.size[0],
             "cfg_scale": 1,
             "rand_device": self.pipe.device,
             "use_gradient_checkpointing": self.use_gradient_checkpointing,
             "use_gradient_checkpointing_offload": self.use_gradient_checkpointing_offload,
         }
+
+    def build_branch_inputs(self, data, image_key="image"):
+        inputs_posi = {"prompt": data["prompt"]}
+        inputs_nega = {"negative_prompt": ""}
+        inputs_shared = self.build_shared_inputs(data[image_key])
+        inputs_shared = self.parse_extra_inputs(data, self.extra_inputs, inputs_shared)
+        return inputs_shared, inputs_posi, inputs_nega
+        
+    def get_pipeline_inputs(self, data):
+        inputs_shared, inputs_posi, inputs_nega = self.build_branch_inputs(data, image_key="image")
         if self.task == "trajectory_imitation":
             inputs_shared["cfg_scale"] = 2
             inputs_shared["teacher"] = self.pipe_teacher
-        inputs_shared = self.parse_extra_inputs(data, self.extra_inputs, inputs_shared)
         return inputs_shared, inputs_posi, inputs_nega
-    
-    def forward(self, data, inputs=None):
-        if inputs is None: inputs = self.get_pipeline_inputs(data)
+
+    def get_preference_inputs(self, data):
+        required_keys = ("chosen_image", "rejected_image")
+        missing_keys = [key for key in required_keys if key not in data]
+        if len(missing_keys) > 0:
+            raise KeyError(
+                "Preference training expects metadata fields "
+                "`chosen_image` and `rejected_image`. "
+                f"Missing: {missing_keys}"
+            )
+        return {
+            "chosen": self.build_branch_inputs(data, image_key="chosen_image"),
+            "rejected": self.build_branch_inputs(data, image_key="rejected_image"),
+        }
+
+    def preprocess_pipeline_inputs(self, inputs):
         inputs = self.transfer_data_to_device(inputs, self.pipe.device, self.pipe.torch_dtype)
         for unit in self.pipe.units:
             inputs = self.pipe.unit_runner(unit, self.pipe, *inputs)
+        return inputs
+
+    def preprocess_preference_inputs(self, preference_inputs):
+        chosen_inputs_shared, chosen_inputs_posi, _ = self.preprocess_pipeline_inputs(preference_inputs["chosen"])
+        rejected_inputs_shared, rejected_inputs_posi, _ = self.preprocess_pipeline_inputs(preference_inputs["rejected"])
+        return {
+            "chosen": {**chosen_inputs_shared, **chosen_inputs_posi},
+            "rejected": {**rejected_inputs_shared, **rejected_inputs_posi},
+        }
+    
+    def forward(self, data, inputs=None):
+        if self.task == "text_pref_dpo":
+            if inputs is None:
+                inputs = self.get_preference_inputs(data)
+            inputs = self.preprocess_preference_inputs(inputs)
+            reference_models = None if self.preference_loss_type != "dpo" else self.get_reference_iteration_models()
+            return self.loss_fn(self.pipe, inputs, reference_models=reference_models)
+        if inputs is None: inputs = self.get_pipeline_inputs(data)
+        inputs = self.preprocess_pipeline_inputs(inputs)
         loss = self.task_to_loss[self.task](self.pipe, *inputs)
         return loss
 
@@ -137,6 +204,11 @@ if __name__ == "__main__":
         fp8_models=args.fp8_models,
         offload_models=args.offload_models,
         task=args.task,
+        preference_loss_type=args.preference_loss_type,
+        preference_beta=args.preference_beta,
+        preference_num_timesteps=args.preference_num_timesteps,
+        preference_loss_weight=args.preference_loss_weight,
+        preference_sft_weight=args.preference_sft_weight,
         device=accelerator.device,
         enable_npu_patch=args.enable_npu_patch
     )
@@ -151,6 +223,7 @@ if __name__ == "__main__":
         "sft:train": launch_training_task,
         "direct_distill": launch_training_task,
         "direct_distill:train": launch_training_task,
+        "text_pref_dpo": launch_training_task,
         "trajectory_imitation": launch_training_task,
     }
     launcher_map[args.task](accelerator, dataset, model, model_logger, args=args)
